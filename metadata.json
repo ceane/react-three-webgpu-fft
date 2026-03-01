@@ -1,0 +1,5 @@
+{
+  "name": "WebGPU Radio Waves",
+  "description": "A 3D visualization of radio waves drawn as lines using WebGPU and React Three Fiber.",
+  "requestFramePermissions": []
+}
