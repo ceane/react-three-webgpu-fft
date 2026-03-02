@@ -1,89 +1,108 @@
-import { useRef, useMemo } from 'react';
+import { useRef, useMemo, useState, useEffect, useCallback } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
+import { Settings2, RotateCcw } from 'lucide-react';
 
-function SpectrumWave() {
+const MIN_FREQ = 0.009; // 9 kHz
+const MAX_FREQ = 5.0;   // 5 MHz
+const BASE_BW = 3.2;    // 3.2 MHz sample rate (max window)
+const COUNT = 1024;
+
+const CMAP = [
+  [0,0,32], [0,0,145], [30,144,255], [255,255,255], [255,255,0], [254,109,22], [255,0,0]
+];
+
+function getColor(v: number) {
+  const idx = Math.max(0, Math.min(1, v)) * (CMAP.length - 1);
+  const i = Math.floor(idx);
+  const f = idx - i;
+  if (i >= CMAP.length - 1) return CMAP[CMAP.length - 1];
+  const c1 = CMAP[i], c2 = CMAP[i+1];
+  return [c1[0] + (c2[0]-c1[0])*f, c1[1] + (c2[1]-c1[1])*f, c1[2] + (c2[2]-c1[2])*f];
+}
+
+function getSignal(f: number, t: number) {
+  let db = -85 + (Math.random() - 0.5) * 8;
+  db += Math.sin(f * 30 + t * 2) * 2;
+  db += Math.sin(f * 100 - t * 1.5) * 1.5;
+  
+  const peaks = [
+    [0.1, 0.005, 20], [0.5, 0.01, 30], [1.088, 0.002, 45], [1.238, 0.005, 50],
+    [1.387, 0.002, 40], [2.5, 0.05, 25], [3.8, 0.01, 35], [4.2, 0.008, 42]
+  ];
+  
+  for (const [pf, pw, pa] of peaks) {
+    const d = Math.abs(f - pf);
+    if (d < pw * 4) {
+      db += Math.exp(-(d * d) / (pw * pw)) * pa * (0.7 + 0.3 * Math.random());
+    }
+  }
+  return Math.min(0, Math.max(-120, db));
+}
+
+function SpectrumWave({ stateRef, sharedFftData, rawFftData }: { stateRef: any, sharedFftData: any, rawFftData: any }) {
   const { viewport } = useThree();
-  const count = 1024; // Number of bins for the stepped look
   const fillMeshRef = useRef<THREE.InstancedMesh>(null);
   const lineMeshRef = useRef<THREE.InstancedMesh>(null);
   const dummy = useMemo(() => new THREE.Object3D(), []);
-
   const geometry = useMemo(() => new THREE.PlaneGeometry(1, 1), []);
   const fillMaterial = useMemo(() => new THREE.MeshBasicMaterial({ color: '#0a2e3f', transparent: true, opacity: 0.8 }), []);
   const lineMaterial = useMemo(() => new THREE.MeshBasicMaterial({ color: '#00d2ff' }), []);
 
   useFrame((state) => {
     if (!fillMeshRef.current || !lineMeshRef.current) return;
+    const { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled } = stateRef.current;
     const time = state.clock.elapsedTime;
     
+    const bw = BASE_BW / zoom;
+    const startF = centerFreq - bw / 2;
     const bottomY = -viewport.height / 2;
-    const binWidth = viewport.width / count;
+    const binWidth = viewport.width / COUNT;
     let lastY: number | null = null;
     
-    for (let i = 0; i < count; i++) {
-      const normalizedX = i / count;
+    // 1. Compute Raw & Average
+    for (let i = 0; i < COUNT; i++) {
+      const f = startF + (i / COUNT) * bw;
+      let db = getSignal(f, time);
       
-      // Stepped noise floor
-      let db = -52 + (Math.random() - 0.5) * 8; 
-      
-      // Slow moving baseline humps
-      db += Math.sin(normalizedX * 15 + time * 2) * 2;
-      db += Math.sin(normalizedX * 40 - time * 1.5) * 1.5;
-      
-      // Simulated peaks matching the reference image
-      const peaks = [
-        { pos: 0.02, width: 0.001, amp: 15 },
-        { pos: 0.06, width: 0.001, amp: 12 },
-        { pos: 0.10, width: 0.001, amp: 18 },
-        { pos: 0.16, width: 0.0015, amp: 30 },
-        { pos: 0.19, width: 0.001, amp: 45 }, // Largest peak
-        { pos: 0.22, width: 0.0015, amp: 35 },
-        { pos: 0.25, width: 0.001, amp: 25 },
-        { pos: 0.27, width: 0.001, amp: 18 },
-        { pos: 0.30, width: 0.001, amp: 15 },
-        
-        { pos: 0.72, width: 0.001, amp: 20 },
-        { pos: 0.75, width: 0.001, amp: 25 },
-        { pos: 0.78, width: 0.001, amp: 18 },
-        { pos: 0.85, width: 0.001, amp: 22 },
-        { pos: 0.88, width: 0.001, amp: 20 },
-        { pos: 0.95, width: 0.001, amp: 24 },
-      ];
-      
-      for (const peak of peaks) {
-        const dist = Math.abs(normalizedX - peak.pos);
-        if (dist < peak.width * 4) {
-          const envelope = Math.exp(-(dist * dist) / (peak.width * peak.width));
-          db += envelope * peak.amp * (0.7 + 0.3 * Math.random());
-        }
+      if (avgEnabled) {
+        rawFftData.current[i] = rawFftData.current[i] * 0.8 + db * 0.2;
+      } else {
+        rawFftData.current[i] = db;
       }
+    }
+
+    // 2. Apply FFT Smoothing & Render
+    for (let i = 0; i < COUNT; i++) {
+      let db = rawFftData.current[i];
+      if (fftSmoothEnabled) {
+        const prev = i > 0 ? rawFftData.current[i - 1] : db;
+        const next = i < COUNT - 1 ? rawFftData.current[i + 1] : db;
+        db = (prev + db + next) / 3;
+      }
+      sharedFftData.current[i] = db;
+
+      if (db > maxDb) db = maxDb;
+      if (db < minDb) db = minDb;
       
-      if (db > 0) db = 0;
-      if (db < -75) db = -75;
-      
-      // Map dB to Y coordinate (-viewport.height/2 to viewport.height/2)
-      // Graph shows 0dB at top, -75dB at bottom
-      const y = ((db + 75) / 75) * viewport.height - viewport.height / 2; 
-      
+      const dbRange = maxDb - minDb;
+      const y = ((db - minDb) / dbRange) * viewport.height - viewport.height / 2; 
+      const normalizedX = i / COUNT;
       const x = (normalizedX - 0.5) * viewport.width;
       
-      // 1. Fill
       const fillHeight = Math.max(y - bottomY, 0);
       dummy.position.set(x + binWidth / 2, bottomY + fillHeight / 2, 0);
       dummy.scale.set(binWidth * 1.05, fillHeight, 1);
       dummy.updateMatrix();
       fillMeshRef.current.setMatrixAt(i, dummy.matrix);
       
-      // 2. Line (Horizontal step)
       const lineThickness = 0.002 * viewport.height;
       dummy.position.set(x + binWidth / 2, y, 0);
       dummy.scale.set(binWidth * 1.05, lineThickness, 1);
       dummy.updateMatrix();
       lineMeshRef.current.setMatrixAt(i * 2, dummy.matrix);
       
-      // 3. Line (Vertical connection to previous step)
       if (lastY !== null) {
         const minY = Math.min(lastY, y);
         const maxY = Math.max(lastY, y);
@@ -97,7 +116,6 @@ function SpectrumWave() {
         dummy.updateMatrix();
         lineMeshRef.current.setMatrixAt(i * 2 + 1, dummy.matrix);
       }
-      
       lastY = y;
     }
     
@@ -107,58 +125,205 @@ function SpectrumWave() {
 
   return (
     <group>
-      <instancedMesh ref={fillMeshRef} args={[geometry, fillMaterial, count]} />
-      <instancedMesh ref={lineMeshRef} args={[geometry, lineMaterial, count * 2]} />
+      <instancedMesh ref={fillMeshRef} args={[geometry, fillMaterial, COUNT]} />
+      <instancedMesh ref={lineMeshRef} args={[geometry, lineMaterial, COUNT * 2]} />
     </group>
   );
 }
 
-export default function App() {
+function Waterfall({ stateRef, sharedFftData }: { stateRef: any, sharedFftData: any }) {
+  const { viewport } = useThree();
+  const height = 512;
+  
+  const wfData = useMemo(() => new Uint8Array(COUNT * height * 4), []);
+  const wfTexture = useMemo(() => {
+    const tex = new THREE.DataTexture(wfData, COUNT, height, THREE.RGBAFormat);
+    tex.needsUpdate = true;
+    return tex;
+  }, [wfData]);
+
+  useFrame(() => {
+    const { minDb, maxDb, wfSmoothEnabled } = stateRef.current;
+    
+    const filter = wfSmoothEnabled ? THREE.LinearFilter : THREE.NearestFilter;
+    if (wfTexture.magFilter !== filter) {
+      wfTexture.magFilter = filter;
+      wfTexture.minFilter = filter;
+      wfTexture.needsUpdate = true;
+    }
+
+    // Shift data down (copy rows 1..511 to rows 0..510)
+    wfData.copyWithin(0, COUNT * 4, COUNT * height * 4);
+    
+    // Write new row to top (row 511)
+    const topRowOffset = COUNT * (height - 1) * 4;
+    const dbRange = maxDb - minDb;
+    
+    for (let i = 0; i < COUNT; i++) {
+      const db = sharedFftData.current[i];
+      const normDb = Math.max(0, Math.min(1, (db - minDb) / dbRange));
+      const color = getColor(normDb);
+      
+      const idx = topRowOffset + i * 4;
+      wfData[idx] = color[0];
+      wfData[idx + 1] = color[1];
+      wfData[idx + 2] = color[2];
+      wfData[idx + 3] = 255;
+    }
+    
+    wfTexture.needsUpdate = true;
+  });
+
   return (
-    <div className="w-full h-screen bg-[#050505] flex items-center justify-center p-4 md:p-8 font-mono select-none">
-      <div className="relative w-full max-w-6xl h-[70vh] bg-[#0b0f13] border border-[#1a262b] rounded-lg overflow-hidden shadow-2xl">
-        
-        {/* Grid Background */}
+    <mesh>
+      <planeGeometry args={[viewport.width, viewport.height]} />
+      <meshBasicMaterial map={wfTexture} />
+    </mesh>
+  );
+}
+
+export default function App() {
+  const [zoom, setZoom] = useState(1);
+  const [centerFreq, setCenterFreq] = useState(2.5);
+  const [minDb, setMinDb] = useState(-100);
+  const [maxDb, setMaxDb] = useState(0);
+  
+  const [avgEnabled, setAvgEnabled] = useState(false);
+  const [fftSmoothEnabled, setFftSmoothEnabled] = useState(false);
+  const [wfSmoothEnabled, setWfSmoothEnabled] = useState(false);
+  const [controlsOpen, setControlsOpen] = useState(true);
+  
+  const stateRef = useRef({ zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled });
+  const vfoTrackRef = useRef<HTMLDivElement>(null);
+  
+  const sharedFftData = useRef(new Float32Array(COUNT).fill(-120));
+  const rawFftData = useRef(new Float32Array(COUNT).fill(-120));
+
+  useEffect(() => {
+    stateRef.current = { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled };
+  }, [zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled]);
+
+  const bw = BASE_BW / zoom;
+  const startF = centerFreq - bw / 2;
+  const endF = centerFreq + bw / 2;
+
+  const handleVfoDrag = useCallback((e: React.MouseEvent | React.TouchEvent) => {
+    if (!vfoTrackRef.current) return;
+    const track = vfoTrackRef.current;
+    
+    const updateFreq = (clientX: number) => {
+      const rect = track.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const totalSpan = MAX_FREQ - MIN_FREQ;
+      let newCenter = MIN_FREQ + ratio * totalSpan;
+      
+      const halfBw = (BASE_BW / stateRef.current.zoom) / 2;
+      newCenter = Math.max(MIN_FREQ + halfBw, Math.min(MAX_FREQ - halfBw, newCenter));
+      setCenterFreq(newCenter);
+    };
+
+    const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
+    updateFreq(clientX);
+
+    const onMove = (ev: MouseEvent | TouchEvent) => {
+      const cx = 'touches' in ev ? ev.touches[0].clientX : ev.clientX;
+      updateFreq(cx);
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('touchmove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('touchend', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('touchmove', onMove);
+    document.addEventListener('mouseup', onUp);
+    document.addEventListener('touchend', onUp);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') {
+        setCenterFreq(f => Math.max(MIN_FREQ + bw/2, f - 0.05));
+      } else if (e.key === 'ArrowRight') {
+        setCenterFreq(f => Math.min(MAX_FREQ - bw/2, f + 0.05));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [bw]);
+
+  const formatFreq = (f: number) => f >= 1 ? `${f.toFixed(3)} MHz` : `${(f * 1000).toFixed(0)} kHz`;
+
+  const getTicks = () => {
+    const step = bw > 2 ? 0.5 : bw > 0.5 ? 0.1 : bw > 0.1 ? 0.05 : 0.01;
+    const ticks = [];
+    const firstTick = Math.ceil(startF / step) * step;
+    for (let f = firstTick; f < endF; f += step) {
+      if (f > startF + 0.05 * bw && f < endF - 0.05 * bw && Math.abs(f - centerFreq) > 0.05 * bw) {
+        ticks.push(f);
+      }
+    }
+    return ticks;
+  };
+
+  const totalSpan = MAX_FREQ - MIN_FREQ;
+  const thumbWidthPct = (bw / totalSpan) * 100;
+  const thumbLeftPct = ((startF - MIN_FREQ) / totalSpan) * 100;
+
+  const resetView = () => {
+    setZoom(1);
+    setMinDb(-100);
+    setMaxDb(0);
+    setCenterFreq(2.5);
+  };
+
+  const ToggleBtn = ({ label, active, onClick }: { label: string, active: boolean, onClick: () => void }) => (
+    <button 
+      onClick={onClick}
+      className={`flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors w-full ${
+        active 
+          ? 'bg-[#2a2a2a] border-[#555] text-white' 
+          : 'bg-[#111] border-[#222] text-[#888] hover:bg-[#1a1a1a]'
+      }`}
+    >
+      <span className="text-[10px] w-3">{active ? '▶' : '▷'}</span>
+      <span className="font-medium tracking-wider">{label}</span>
+    </button>
+  );
+
+  return (
+    <div className="w-full h-screen bg-[#050505] flex flex-col font-mono select-none text-[#6b7d85] text-[11px] overflow-hidden">
+      
+      {/* Top: Spectrum Analyzer */}
+      <div className="relative h-[45vh] w-full border-b border-[#1a262b]">
+        {/* Grid Lines */}
         <div className="absolute inset-0 flex flex-col justify-between z-0 pointer-events-none">
-          {Array.from({ length: 8 }).map((_, i) => (
+          {Array.from({ length: 6 }).map((_, i) => (
             <div key={`h-${i}`} className="w-full h-[1px] bg-[#1a262b] opacity-60" />
           ))}
         </div>
         
-        {/* Vertical Grid Lines */}
-        <div className="absolute inset-0 z-0 pointer-events-none">
-          <div className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 left-[16.66%]" />
-          <div className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 left-[33.33%]" />
-          <div className="absolute top-0 bottom-0 w-[1px] bg-[#8b9a2d] opacity-80 left-[50%]" />
-          <div className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 left-[66.66%]" />
-          <div className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 left-[83.33%]" />
-        </div>
-
         {/* Y-Axis Labels */}
-        <div className="absolute left-4 top-0 bottom-0 flex flex-col justify-between items-start text-[11px] text-[#6b7d85] z-10 pointer-events-none py-1">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <span key={`yl-${i}`} className="leading-none bg-[#0b0f13] pr-2">
-              {i === 0 ? '0dB' : `-${i * 10}`}
-            </span>
-          ))}
+        <div className="absolute left-2 top-0 bottom-0 flex flex-col justify-between items-start z-10 pointer-events-none py-1">
+          {Array.from({ length: 6 }).map((_, i) => {
+            const db = maxDb - i * ((maxDb - minDb) / 5);
+            return <span key={`yl-${i}`} className="bg-[#050505] pr-1">{db.toFixed(0)}dB</span>;
+          })}
         </div>
 
-        {/* X-Axis Top Labels */}
-        <div className="absolute top-4 left-0 right-0 text-[11px] text-[#6b7d85] z-10 pointer-events-none">
-          <span className="absolute left-[16.66%] -translate-x-1/2">100kHz</span>
-          <span className="absolute left-[33.33%] -translate-x-1/2">50kHz</span>
-          <span className="absolute left-[66.66%] -translate-x-1/2">50kHz</span>
-          <span className="absolute left-[83.33%] -translate-x-1/2">100kHz</span>
-        </div>
+        {/* Dynamic Ticks */}
+        {getTicks().map(f => {
+          const leftPct = ((f - startF) / bw) * 100;
+          return (
+            <div key={f} className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 z-0 pointer-events-none" style={{ left: `${leftPct}%` }}>
+              <span className="absolute top-2 -translate-x-1/2 bg-[#050505] px-1">{formatFreq(f)}</span>
+            </div>
+          );
+        })}
 
-        {/* X-Axis Bottom Labels */}
-        <div className="absolute bottom-4 left-4 right-4 flex justify-between items-end text-[12px] text-[#6b7d85] z-10 pointer-events-none">
-          <span>1.088MHz</span>
-          <span className="text-white font-medium flex items-center gap-2 text-[13px]">
-            <span className="text-[#e2b714] text-base">🖐</span> 1.238MHz
-          </span>
-          <span>1.387MHz</span>
-        </div>
+        {/* Center Line */}
+        <div className="absolute top-0 bottom-0 w-[1px] bg-[#8b9a2d] opacity-80 left-[50%] z-0 pointer-events-none" />
 
         {/* WebGPU Canvas */}
         <div className="absolute inset-0 z-0">
@@ -171,10 +336,124 @@ export default function App() {
               return renderer;
             }}
           >
-            <SpectrumWave />
+            <SpectrumWave stateRef={stateRef} sharedFftData={sharedFftData} rawFftData={rawFftData} />
           </Canvas>
         </div>
+
+        {/* Controls Toggle */}
+        <button 
+          onClick={() => setControlsOpen(!controlsOpen)}
+          className="absolute right-4 top-4 z-30 p-2 bg-[#0b0f13]/80 border border-[#1a262b] rounded text-[#6b7d85] hover:text-white transition-colors backdrop-blur-sm"
+        >
+          <Settings2 size={16} />
+        </button>
+
+        {/* Sliders & Toggles Overlay */}
+        {controlsOpen && (
+          <div className="absolute right-4 top-14 z-20 bg-[#0b0f13]/90 p-4 rounded-lg border border-[#1a262b] backdrop-blur-md flex flex-col gap-6 shadow-2xl">
+            <div className="flex gap-6 justify-center">
+              <div className="flex flex-col items-center gap-2">
+                <span>Zoom</span>
+                <input 
+                  type="range" min="0" max="100" 
+                  value={(Math.log10(zoom) / Math.log10(100)) * 100}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    const newZoom = Math.pow(10, (val / 100) * 2);
+                    const newBw = BASE_BW / newZoom;
+                    setCenterFreq(f => Math.max(MIN_FREQ + newBw/2, Math.min(MAX_FREQ - newBw/2, f)));
+                    setZoom(newZoom);
+                  }}
+                  className="h-32 appearance-none bg-[#1a262b] w-2 rounded-full outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-[#00d2ff] [&::-webkit-slider-thumb]:rounded-full cursor-pointer"
+                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                />
+                <span>{zoom.toFixed(1)}x</span>
+              </div>
+              <div className="flex flex-col items-center gap-2">
+                <span>Max</span>
+                <input 
+                  type="range" min="-80" max="0" value={maxDb}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (val > minDb + 10) setMaxDb(val);
+                  }}
+                  className="h-32 appearance-none bg-[#1a262b] w-2 rounded-full outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-[#00d2ff] [&::-webkit-slider-thumb]:rounded-full cursor-pointer"
+                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                />
+              </div>
+              <div className="flex flex-col items-center gap-2">
+                <span>Min</span>
+                <input 
+                  type="range" min="-120" max="-20" value={minDb}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (val < maxDb - 10) setMinDb(val);
+                  }}
+                  className="h-32 appearance-none bg-[#1a262b] w-2 rounded-full outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-[#00d2ff] [&::-webkit-slider-thumb]:rounded-full cursor-pointer"
+                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-4 border-t border-[#1a262b]">
+              <ToggleBtn label="AVG" active={avgEnabled} onClick={() => setAvgEnabled(!avgEnabled)} />
+              <ToggleBtn label="FFT" active={fftSmoothEnabled} onClick={() => setFftSmoothEnabled(!fftSmoothEnabled)} />
+              <ToggleBtn label="WF" active={wfSmoothEnabled} onClick={() => setWfSmoothEnabled(!wfSmoothEnabled)} />
+              
+              <button 
+                onClick={resetView}
+                className="mt-2 flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-[#1a262b] bg-[#111] text-[#888] hover:bg-[#1a1a1a] hover:text-white transition-colors"
+              >
+                <RotateCcw size={14} />
+                <span className="font-medium tracking-wider">RESET</span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Middle: VFO & Axis */}
+      <div className="h-[70px] bg-[#0b0f13] flex flex-col justify-center px-4 gap-2 border-b border-[#1a262b] shrink-0 relative">
+        <div className="absolute left-4 bottom-8 text-[12px]">{formatFreq(startF)}</div>
+        
+        {/* Absolutely centered frequency to prevent jumping */}
+        <div className="absolute left-1/2 -translate-x-1/2 bottom-8 text-white font-medium flex items-center gap-2 text-[13px]">
+          <span className="text-[#e2b714] text-base">○</span> {formatFreq(centerFreq)}
+        </div>
+        
+        <div className="absolute right-4 bottom-8 text-[12px]">{formatFreq(endF)}</div>
+        
+        {/* VFO Track */}
+        <div 
+          ref={vfoTrackRef}
+          onMouseDown={handleVfoDrag}
+          onTouchStart={handleVfoDrag}
+          className="w-full h-6 bg-[#1a262b] rounded-md relative cursor-pointer overflow-hidden mt-6"
+        >
+          <div 
+            className="absolute top-0 bottom-0 bg-[#3B3B3B] rounded-md border border-[#5e5e5e] transition-none"
+            style={{ left: `${thumbLeftPct}%`, width: `${thumbWidthPct}%` }}
+          >
+            <div className="absolute left-1/2 top-1 bottom-1 w-[2px] -translate-x-1/2 bg-[#8b9a2d] opacity-50" />
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom: Waterfall (Now WebGPU) */}
+      <div className="flex-1 relative w-full">
+        <Canvas
+          orthographic
+          camera={{ position: [0, 0, 5], zoom: 1 }}
+          gl={async (props) => {
+            const renderer = new WebGPURenderer({ ...(props as any), antialias: false, alpha: false });
+            await renderer.init();
+            return renderer;
+          }}
+        >
+          <Waterfall stateRef={stateRef} sharedFftData={sharedFftData} />
+        </Canvas>
+      </div>
+
     </div>
   );
 }
