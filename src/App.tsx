@@ -2,7 +2,7 @@ import { useRef, useMemo, useState, useEffect, useCallback } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { Settings2, RotateCcw } from 'lucide-react';
+import { Settings2, RotateCcw, Pause, Play } from 'lucide-react';
 
 const MIN_FREQ = 0.009; // 9 kHz
 const MAX_FREQ = 5.0;   // 5 MHz
@@ -52,9 +52,11 @@ function SpectrumWave({ stateRef, sharedFftData, rawFftData }: { stateRef: any, 
 
   useFrame((state) => {
     if (!fillMeshRef.current || !lineMeshRef.current) return;
-    const { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled } = stateRef.current;
+    const { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, isPaused } = stateRef.current;
     const time = state.clock.elapsedTime;
     
+    if (isPaused) return;
+
     const bw = BASE_BW / zoom;
     const startF = centerFreq - bw / 2;
     const bottomY = -viewport.height / 2;
@@ -143,8 +145,10 @@ function Waterfall({ stateRef, sharedFftData }: { stateRef: any, sharedFftData: 
   }, [wfData]);
 
   useFrame(() => {
-    const { minDb, maxDb, wfSmoothEnabled } = stateRef.current;
+    const { minDb, maxDb, wfSmoothEnabled, isPaused } = stateRef.current;
     
+    if (isPaused) return;
+
     const filter = wfSmoothEnabled ? THREE.LinearFilter : THREE.NearestFilter;
     if (wfTexture.magFilter !== filter) {
       wfTexture.magFilter = filter;
@@ -192,16 +196,17 @@ export default function App() {
   const [fftSmoothEnabled, setFftSmoothEnabled] = useState(false);
   const [wfSmoothEnabled, setWfSmoothEnabled] = useState(false);
   const [controlsOpen, setControlsOpen] = useState(true);
+  const [isPaused, setIsPaused] = useState(false);
   
-  const stateRef = useRef({ zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled });
+  const stateRef = useRef({ zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled, isPaused });
   const vfoTrackRef = useRef<HTMLDivElement>(null);
   
   const sharedFftData = useRef(new Float32Array(COUNT).fill(-120));
   const rawFftData = useRef(new Float32Array(COUNT).fill(-120));
 
   useEffect(() => {
-    stateRef.current = { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled };
-  }, [zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled]);
+    stateRef.current = { zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled, isPaused };
+  }, [zoom, centerFreq, minDb, maxDb, avgEnabled, fftSmoothEnabled, wfSmoothEnabled, isPaused]);
 
   const bw = BASE_BW / zoom;
   const startF = centerFreq - bw / 2;
@@ -253,14 +258,22 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [bw]);
 
-  const formatFreq = (f: number) => f >= 1 ? `${f.toFixed(3)} MHz` : `${(f * 1000).toFixed(0)} kHz`;
+  const formatFreq = (f: number) => f >= 1 ? `${f.toFixed(3)}MHz` : `${(f * 1000).toFixed(0)}kHz`;
 
   const getTicks = () => {
     const step = bw > 2 ? 0.5 : bw > 0.5 ? 0.1 : bw > 0.1 ? 0.05 : 0.01;
     const ticks = [];
     const firstTick = Math.ceil(startF / step) * step;
     for (let f = firstTick; f < endF; f += step) {
-      if (f > startF + 0.05 * bw && f < endF - 0.05 * bw && Math.abs(f - centerFreq) > 0.05 * bw) {
+      // Prevent collision with center and edges
+      const distToCenter = Math.abs(f - centerFreq);
+      const distToStart = Math.abs(f - startF);
+      const distToEnd = Math.abs(f - endF);
+      
+      // Minimum distance ratio to prevent text overlap
+      const minRatio = 0.08; 
+      
+      if (distToCenter > bw * minRatio && distToStart > bw * minRatio && distToEnd > bw * minRatio) {
         ticks.push(f);
       }
     }
@@ -312,13 +325,11 @@ export default function App() {
           })}
         </div>
 
-        {/* Dynamic Ticks */}
+        {/* Dynamic Ticks (Lines only, labels moved to VFO) */}
         {getTicks().map(f => {
           const leftPct = ((f - startF) / bw) * 100;
           return (
-            <div key={f} className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 z-0 pointer-events-none" style={{ left: `${leftPct}%` }}>
-              <span className="absolute top-2 -translate-x-1/2 bg-[#050505] px-1">{formatFreq(f)}</span>
-            </div>
+            <div key={f} className="absolute top-0 bottom-0 w-[1px] bg-[#1a262b] opacity-60 z-0 pointer-events-none" style={{ left: `${leftPct}%` }} />
           );
         })}
 
@@ -340,13 +351,25 @@ export default function App() {
           </Canvas>
         </div>
 
-        {/* Controls Toggle */}
-        <button 
-          onClick={() => setControlsOpen(!controlsOpen)}
-          className="absolute right-4 top-4 z-30 p-2 bg-[#0b0f13]/80 border border-[#1a262b] rounded text-[#6b7d85] hover:text-white transition-colors backdrop-blur-sm"
-        >
-          <Settings2 size={16} />
-        </button>
+        {/* Top Controls (Pause & Settings) */}
+        <div className="absolute right-4 top-4 z-30 flex gap-2">
+          <button 
+            onClick={() => setIsPaused(!isPaused)}
+            className={`p-2 border rounded transition-colors backdrop-blur-sm ${
+              isPaused 
+                ? 'bg-[#e2b714]/20 border-[#e2b714] text-[#e2b714]' 
+                : 'bg-[#0b0f13]/80 border-[#1a262b] text-[#6b7d85] hover:text-white'
+            }`}
+          >
+            {isPaused ? <Play size={16} /> : <Pause size={16} />}
+          </button>
+          <button 
+            onClick={() => setControlsOpen(!controlsOpen)}
+            className="p-2 bg-[#0b0f13]/80 border border-[#1a262b] rounded text-[#6b7d85] hover:text-white transition-colors backdrop-blur-sm"
+          >
+            <Settings2 size={16} />
+          </button>
+        </div>
 
         {/* Sliders & Toggles Overlay */}
         {controlsOpen && (
@@ -416,8 +439,18 @@ export default function App() {
       <div className="h-[70px] bg-[#0b0f13] flex flex-col justify-center px-4 gap-2 border-b border-[#1a262b] shrink-0 relative">
         <div className="absolute left-4 bottom-8 text-[12px]">{formatFreq(startF)}</div>
         
+        {/* Dynamic Tick Labels */}
+        {getTicks().map(f => {
+          const leftPct = ((f - startF) / bw) * 100;
+          return (
+            <div key={f} className="absolute bottom-8 text-[12px] text-[#4a5a63] -translate-x-1/2" style={{ left: `${leftPct}%` }}>
+              {formatFreq(f)}
+            </div>
+          );
+        })}
+        
         {/* Absolutely centered frequency to prevent jumping */}
-        <div className="absolute left-1/2 -translate-x-1/2 bottom-8 text-white font-medium flex items-center gap-2 text-[13px]">
+        <div className="absolute left-1/2 -translate-x-1/2 bottom-8 text-white font-medium flex items-center gap-2 text-[13px] bg-[#0b0f13] px-2 z-10">
           <span className="text-[#e2b714] text-base">○</span> {formatFreq(centerFreq)}
         </div>
         
