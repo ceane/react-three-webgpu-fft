@@ -1,5 +1,6 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+<img width="738" height="730" alt="Screenshot 2026-03-01 at 22 07 53" src="https://github.com/user-attachments/assets/c74ce111-00fa-4312-9bc3-6f697723cbe0" />
+<img width="739" height="735" alt="Screenshot 2026-03-01 at 22 07 40" src="https://github.com/user-attachments/assets/d5808a69-cd1f-4159-ba94-78d07a635918" />
 </div>
 
 # Run and deploy your AI Studio app
